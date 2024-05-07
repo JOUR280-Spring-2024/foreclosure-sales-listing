@@ -1,6 +1,9 @@
 import requests
 from bs4 import BeautifulSoup
-import sqlite3
+import datetime
+from sqlalchemy import create_engine
+from sqlalchemy import MetaData, Table, Column, String, Float, Boolean
+from sqlalchemy.dialects.sqlite import insert
 
 all_links = []
 
@@ -32,7 +35,7 @@ if response.status_code == 200:
 
     if open_links:
         for link in open_links:
-            all_links.append(f"{base_url}{link['href']}")
+            all_links.append({'link': f"{base_url}{link['href']}", 'open': True})
     else:
         print("No links found on the page")
 else:
@@ -56,37 +59,53 @@ if response.status_code == 200:
 
     if closed_links:
         for link in closed_links:
-            all_links.append(f"{base_url}{link['href']}")
+            all_links.append({'link': f"{base_url}{link['href']}", 'open': False})
     else:
         print("No table found on the page")
 else:
     print(f"Failed to retrieve content, status code: {response.status_code}")
 
-# Connect to SQLite Database
-conn = sqlite3.connect('sales_data.db')
-c = conn.cursor()
+engine = create_engine('sqlite:///foreclosure_sales_data.sqlite')
+metadata = MetaData()
+sales_listing_detail = Table('SalesListingDetail', metadata,
+                             Column('SheriffNumber', String, primary_key=True),
+                             Column('JudgmentValue', Float),
+                             Column('CourtCaseNumber', String),
+                             Column('SalesDate', String),
+                             Column('Plaintiff', String),
+                             Column('Defendant', String),
+                             Column('ParcelNumber', String),
+                             Column('Address', String),
+                             Column('Attorney', String),
+                             Column('Open', Boolean),
+                             Column('CreatedAt', String),
+                             Column('LastUpdate', String))
+status_history = Table('StatusHistory', metadata,
+                       Column('SheriffNumber', String, primary_key=True),
+                       Column('Status', String, primary_key=True),
+                       Column('Date', String, primary_key=True),
+                       Column('Amount', Float),
+                       Column('Name', String),
+                       Column('CreatedAt', String),
+                       Column('LastUpdate', String))
+metadata.create_all(engine)
 
-# Create tables
-c.execute('CREATE TABLE IF NOT EXISTS SalesListingDetail (\n'
-          '  SheriffNo TEXT PRIMARY KEY,\n'
-          '  JudgementValue TEXT,\n'
-          '  CourtCaseNo TEXT,\n'
-          '  SalesDate TEXT,\n'
-          '  Plaintiff TEXT,\n'
-          '  Defendant TEXT,\n'
-          '  Parcel TEXT,\n'
-          '  Address TEXT,\n'
-          '  Attorney TEXT)')
-# c.execute('''CREATE TABLE IF NOT EXISTS StatusHistory (PropertyId INTEGER, StatusDate TEXT, StatusDescription TEXT, FOREIGN KEY(PropertyId) REFERENCES SalesListingDetail(PropertyId))''')
+# Get the current date and time
+current_time = datetime.datetime.now()
+# Format the timestamp as a string
+created_at = current_time.strftime('%Y-%m-%d %H:%M:%S')
 
 # Scrape each detail link
+num_link = 1
 for link in all_links:
-    response = session.get(link)
+    print(f"{num_link}/{len(all_links)}: {link['link']}")
+    num_link = num_link + 1
+    response = session.get(link['link'])
     detail_soup = BeautifulSoup(response.text, 'html.parser')
 
     # Safely extract data from detail page using checks for None
     sheriff_no_elem = detail_soup.select_one('table:nth-of-type(1) tr:nth-of-type(1) td:nth-of-type(2)')
-    judgement_value_elem = detail_soup.select_one('tr:nth-of-type(2) td:nth-of-type(2)')
+    judgment_value_elem = detail_soup.select_one('tr:nth-of-type(2) td:nth-of-type(2)')
     court_case_no_elem = detail_soup.select_one('tr:nth-of-type(3) td:nth-of-type(2)')
     sales_date_elem = detail_soup.select_one('tr:nth-of-type(4) td:nth-of-type(2)')
     plaintiff_elem = detail_soup.select_one('tr:nth-of-type(5) td:nth-of-type(2)')
@@ -99,32 +118,79 @@ for link in all_links:
         sheriff_no = sheriff_no_elem.text.strip()
     else:
         sheriff_no = None
-    judgement_value = judgement_value_elem.text.strip() if judgement_value_elem else None
+    judgment_value = judgment_value_elem.text.strip() if judgment_value_elem else None
     court_case_no = court_case_no_elem.text.strip() if court_case_no_elem else None
-    sales_date = sales_date_elem.text.strip() if sales_date_elem else None
+    if sales_date_elem is not None:
+        sales_date = sales_date_elem.text.strip()
+        sales_date = datetime.datetime.strptime(sales_date, '%m/%d/%Y').strftime('%Y-%m-%d')
+    else:
+        sales_date = None
     plaintiff = plaintiff_elem.text.strip() if plaintiff_elem else None
     defendant = defendant_elem.text.strip() if defendant_elem else None
     parcel = parcel_elem.text.strip() if parcel_elem else None
     address = address_elem.text.strip() if address_elem else None
     attorney = attorney_elem.text.strip() if attorney_elem else None
 
-    print(sheriff_no, judgement_value, court_case_no, sales_date, plaintiff, defendant, parcel, address, attorney)
+    with engine.connect() as connection:
+        insert_query = insert(sales_listing_detail).values(SheriffNumber=sheriff_no,
+                                                           JudgmentValue=float(
+                                                               judgment_value.replace("$", "").replace(",", "")),
+                                                           CourtCaseNumber=court_case_no,
+                                                           SalesDate=sales_date,
+                                                           Plaintiff=plaintiff,
+                                                           Defendant=defendant,
+                                                           ParcelNumber=parcel,
+                                                           Address=address,
+                                                           Attorney=attorney,
+                                                           Open=link['open'],
+                                                           CreatedAt=created_at,
+                                                           LastUpdate=created_at)
+        connection.execute(insert_query.on_conflict_do_update(
+            index_elements=['SheriffNumber'],
+            set_=dict(
+                JudgmentValue=insert_query.excluded.JudgmentValue,
+                CourtCaseNumber=insert_query.excluded.CourtCaseNumber,
+                SalesDate=insert_query.excluded.SalesDate,
+                Plaintiff=insert_query.excluded.Plaintiff,
+                Defendant=insert_query.excluded.Defendant,
+                ParcelNumber=insert_query.excluded.ParcelNumber,
+                Address=insert_query.excluded.Address,
+                Attorney=insert_query.excluded.Attorney,
+                Open=insert_query.excluded.Open,
+                LastUpdate=insert_query.excluded.LastUpdate
+            )
+        ))
 
-    # Insert data into SalesListingDetail
-    c.execute(
-        'INSERT INTO SalesListingDetail (SheriffNo, JudgementValue, CourtCaseNo, SalesDate, Plaintiff, Defendant, Parcel, Address, Attorney) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        (sheriff_no, judgement_value, court_case_no, sales_date, plaintiff, defendant, parcel, address, attorney))
-    # property_id = c.lastrowid
+        history = detail_soup.select_one('table:nth-of-type(2)')
+        history_rows = history.select('tr:not(:first-child)')
+        for row in history_rows:
+            columns = row.select('td')
+            status = columns[0].text.strip()
+            date = columns[1].text.strip()
+            date = datetime.datetime.strptime(date, '%m/%d/%Y').strftime('%Y-%m-%d')
 
-    # Extracting status history
-    # status_history = detail_soup.find_all('selector_for_status_history')
-    # for status in status_history:
-    #    status_date = status.find('date_selector').text if status.find('date_selector') else 'Unavailable'
-    #    status_description = status.find('desc_selector').text if status.find('desc_selector') else 'Unavailable'
-    #    c.execute('INSERT INTO StatusHistory (PropertyId, StatusDate, StatusDescription) VALUES (?, ?, ?)', (property_id, status_date, status_description))
+            if len(columns) == 4:
+                amount = float(columns[2].text.strip().replace("$", "").replace(",", ""))
+                name = columns[3].text.strip()
+            else:
+                amount = None
+                name = None
+            insert_query = insert(status_history).values(SheriffNumber=sheriff_no,
+                                                         Status=status,
+                                                         Date=date,
+                                                         Amount=amount,
+                                                         Name=name,
+                                                         CreatedAt=created_at,
+                                                         LastUpdate=created_at)
+            connection.execute(insert_query.on_conflict_do_update(
+                index_elements=['SheriffNumber', 'Status', 'Date'],
+                set_=dict(
+                    Status=insert_query.excluded.Status,
+                    Date=insert_query.excluded.Date,
+                    Amount=insert_query.excluded.Amount,
+                    Name=insert_query.excluded.Name,
+                    LastUpdate=insert_query.excluded.LastUpdate
+                )
+            ))
 
-    # Commit after each property to save changes
-conn.commit()
-
-# Close the database connection
-conn.close()
+        connection.commit()
